@@ -140,6 +140,27 @@ function fmtUsd(n, d = 2) {
   if (a >= 1e4) return s + '$' + (a / 1e3).toFixed(1) + 'K';
   return s + '$' + a.toFixed(d);
 }
+/* ---- Market Cap statt Rohpreis (für Positions-Karten: Entry/Aktuell/Stop/TP in Mc anzeigen) ---- */
+function fmtMc(n) {
+  if (!isNum(n) || n <= 0) return '—';
+  const a = Math.abs(n);
+  if (a >= 1e9) return (a / 1e9).toFixed(2) + 'B Mc';
+  if (a >= 1e6) return (a / 1e6).toFixed(2) + 'M Mc';
+  if (a >= 1e3) return (a / 1e3).toFixed(1) + 'k Mc';
+  return Math.round(a) + ' Mc';
+}
+/* Verhältnis Mc/Preis: bevorzugt der beim Einstieg festgehaltene Wert (stabil, unabhängig von Live-Daten),
+   sonst das aktuelle Live-Verhältnis des Tokens. Damit lassen sich auch Stop/TP-Zielpreise (die es am Markt
+   so nie gab) in einen impliziten Market Cap umrechnen. */
+function posMcRatio(pos, t) {
+  if (pos && isNum(pos.entryMc) && isNum(pos.entryPrice) && pos.entryPrice > 0) return pos.entryMc / pos.entryPrice;
+  if (t && t.A && t.A.core && isNum(t.A.core.mc) && isNum(t.A.core.price) && t.A.core.price > 0) return t.A.core.mc / t.A.core.price;
+  return null;
+}
+function priceToMc(pos, t, price) {
+  const r = posMcRatio(pos, t);
+  return (r != null && isNum(price) && price > 0) ? price * r : null;
+}
 const fmtSigned = (n, f = fmtUsd) => (!isNum(n) ? '—' : (n > 0 ? '+' : '') + f(n));
 function fmtPct(v, d = 1) { return isNum(v) ? (v > 0 ? '+' : '') + v.toFixed(d) + '%' : '—'; }
 function fmtNum(v, d = 0) { return isNum(v) ? v.toLocaleString('de-DE', { maximumFractionDigits: d, minimumFractionDigits: d }) : '—'; }
@@ -2083,6 +2104,7 @@ function createCore(opts) {
         id: 'T-' + now.toString(36).toUpperCase() + '-' + (++seqs.pos).toString(36).toUpperCase(), tokenId: t.id, mint: t.mint, symbol: t.symbol, name: t.name,
         pair: A.core.pairAddress, dexId: A.core.dexId, mode: state.mode, status: 'OPEN', openedAt: now, entries: [], exits: [],
         qty: 0, initialQty: 0, costUsd: 0, investedUsd: 0, feesUsd: 0, slippageUsd: 0, realizedUsd: 0, entryPrice: null,
+        entryMc: isNum(A.core.mc) ? A.core.mc : null,
         highest: f.refPrice, stop: null, stopType: 'PERCENT', tps: [], tpHit: [false, false, false], breakEven: false, trailing: false,
         strategy: f.lead || null, entryLiq: A.liq.usd, lastPrice: f.refPrice, lastPriceAt: now, priceLabel: 'LIVE', value: null, pnlUsd: null, pnlPct: null,
         mae2m: 0, timeExitFlag: false, exitPending: null, paramVersion: state.activeParam, entryScore: A.finalScore
@@ -3969,14 +3991,17 @@ function positionCard(p) {
   const S = core.S(), t = tok(p.tokenId), now = Date.now();
   const pnlOk = isNum(p.pnlUsd);
   const eq = core.equityInfo();
-  const tpTxt = (i) => html`${fmtPrice(p.tps[i])} ${p.tpHit[i] ? '✓' : ''}`;
+  const mc = (price) => fmtMc(priceToMc(p, t, price));
+  const curMc = (t && t.A && t.A.core && isNum(t.A.core.mc)) ? t.A.core.mc : priceToMc(p, t, p.lastPrice);
+  const entryMc = isNum(p.entryMc) ? p.entryMc : priceToMc(p, t, p.entryPrice);
+  const tpTxt = (i) => html`${mc(p.tps[i])} ${p.tpHit[i] ? '✓' : ''}`;
   return html`<div class="card"><div class="ch"><b>${p.symbol}</b><span class="chip vio">${p.mode}</span><span class="chip">${p.strategy || 'manuell'}</span>${lbl(p.priceLabel || 'UNKNOWN')}<span class="ag">Haltedauer ${fmtAge(now - p.openedAt)}</span></div>
     <div class="grid4" style="margin-top:8px">
-      ${kv('Entry (Ø Fill)', fmtPrice(p.entryPrice))}${kv('Aktuell', fmtPrice(p.lastPrice), p.priceLabel)}
+      ${kv('Entry (Ø Fill)', fmtMc(entryMc), null, fmtPrice(p.entryPrice))}${kv('Aktuell', fmtMc(curMc), p.priceLabel, fmtPrice(p.lastPrice))}
       ${kv('PnL (fee-adj.)', pnlOk ? fmtSigned(p.pnlUsd) : 'nicht verfügbar', pnlOk ? 'SIMULATED' : 'UNKNOWN')}${kv('PnL %', pnlOk ? fmtPct(p.pnlPct) : '—')}
       ${kv('Größe (Kosten)', fmtUsd(p.costUsd))}${kv('Exposure', eq.equity > 0 ? (p.costUsd / eq.equity * 100).toFixed(1) + '%' : '—')}
-      ${kv('Stop (' + p.stopType + ')', fmtPrice(p.stop))}${kv('Trailing', p.trailing ? 'aktiv' : 'ab +' + S.trailActivatePct + '%')}
-      ${kv('TP1', tpTxt(0))}${kv('TP2', tpTxt(1))}${kv('TP3', fmtPrice(p.tps[2]))}${kv('Risk', t && t.A ? t.A.risk.level + ' ' + t.A.risk.total : '—')}
+      ${kv('Stop (' + p.stopType + ')', mc(p.stop), null, fmtPrice(p.stop))}${kv('Trailing', p.trailing ? 'aktiv' : 'ab +' + S.trailActivatePct + '%')}
+      ${kv('TP1', tpTxt(0), null, fmtPrice(p.tps[0]))}${kv('TP2', tpTxt(1), null, fmtPrice(p.tps[1]))}${kv('TP3', mc(p.tps[2]), null, fmtPrice(p.tps[2]))}${kv('Risk', t && t.A ? t.A.risk.level + ' ' + t.A.risk.total : '—')}
       ${kv('Realisiert', fmtSigned(p.realizedUsd), 'SIMULATED')}${kv('Fees', fmtUsd(p.feesUsd, 4))}${kv('Exit-Impact (voll)', isNum(p.exitImpactPct) ? p.exitImpactPct.toFixed(2) + '%' : '—', 'ESTIMATED')}${kv('Buys', p.entries.length + '/' + Math.min(S.maxBuysPerCoin, 2))}
     </div>
     ${p.timeExitFlag ? html`<p class="note warn">⏱ Time Exit Candidate – erwartete Bewegung blieb aus.</p>` : ''}
