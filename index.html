@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#070b14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="description" content="Smart Lab – Solana Memecoin Scanner, Risk Engine und Simulations-Trading-Terminal">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src data:; connect-src https:; base-uri 'none'; form-action 'none'; object-src 'none'">
+<meta name="referrer" content="no-referrer">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%23070b14'/%3E%3Ccircle cx='12' cy='12' r='7' fill='none' stroke='%23f472b6' stroke-width='2'/%3E%3Ccircle cx='12' cy='12' r='3' fill='none' stroke='%2338bdf8' stroke-width='2'/%3E%3C/svg%3E">
+<title>Smart Lab</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<a class="skip" href="#center">Zum Inhalt springen</a>
+<header class="topbar" id="topbar">
+  <div class="brand"><h1>Smart Lab</h1><span class="ver" id="verBanner" title="Versionen">v–</span></div>
+  <div class="pills" id="tbPills" aria-live="polite"></div>
+  <button class="estop" id="btnEstop" data-act="estop" aria-label="Emergency Stop: alle neuen Käufe sofort blockieren">⛔ EMERGENCY STOP</button>
+</header>
+<div id="banner" class="banner" role="status" hidden></div>
+<div class="layout">
+  <nav class="sidebar" id="sidebar" aria-label="Hauptnavigation"></nav>
+  <main class="center" id="center" tabindex="-1">
+    <section class="panel control" id="control" aria-label="Bot-Steuerung"></section>
+    <section class="tiles" id="tiles" aria-label="Schnellübersicht"></section>
+    <div id="views">
+      <section class="view" id="v-scanner" aria-label="Scanner">
+        <h3 class="sec-h">🔥 Top-Kandidaten</h3>
+        <div class="hot" id="hot"></div>
+        <div class="toolbar">
+          <input type="search" id="q" placeholder="Suche Symbol, Name oder Mint-Adresse" aria-label="Token suchen" autocomplete="off">
+          <label class="switch" id="swRec" tabindex="0" role="switch" aria-checked="false"><input type="checkbox" id="fRec" class="hidden"><span class="tg"></span>nur Empfehlungen</label>
+          <label class="switch" id="swSafe" tabindex="0" role="switch" aria-checked="false"><input type="checkbox" id="fSafe" class="hidden"><span class="tg"></span>ohne Risiko</label>
+          <select id="fAge" aria-label="Filter Token-Alter"><option value="">Alle Alter</option><option value="NEW">NEW (&lt;1h)</option><option value="EARLY">EARLY (&lt;24h)</option><option value="ESTABLISHED">ESTABLISHED (&lt;7d)</option><option value="MATURE">MATURE</option></select>
+          <button class="btn" id="btnNotify" data-act="notify">🔔 Alarme an</button>
+        </div>
+        <details class="panel tight" id="filterBox"><summary>⚙ Filter, Profile &amp; Ansicht</summary><div id="filterForm" style="margin-top:10px"></div></details>
+        <div class="chips" id="sortChips" role="toolbar" aria-label="Sortierung"></div>
+        <div id="mkInfo" class="note" style="margin:0 0 6px"></div>
+        <div class="mwrap"><div class="mhead" id="mkHead" role="row"></div>
+        <div id="mkList" role="table" aria-label="Live Market Tabelle"></div></div>
+      </section>
+      <section class="view hidden" id="v-signals" aria-label="Signale"></section>
+      <section class="view hidden" id="v-markets" aria-label="Markt"></section>
+      <section class="view hidden" id="v-watchlist" aria-label="Watchlist"></section>
+      <section class="view hidden" id="v-positions" aria-label="Positionen"></section>
+      <section class="view hidden" id="v-orders" aria-label="Orders"></section>
+      <section class="view hidden" id="v-history" aria-label="Trade History">
+        <div class="toolbar">
+          <input type="search" id="hq" placeholder="Suche Token, Mint, Grund" aria-label="History durchsuchen">
+          <select id="hMode" aria-label="Modus"><option value="">Alle Modi</option><option>SIMULATION</option><option>PAPER</option></select>
+          <select id="hRes" aria-label="Ergebnis"><option value="">Alle</option><option value="win">Gewinn</option><option value="loss">Verlust</option><option value="open">Offen</option></select>
+          <button class="btn sm" data-act="export" data-kind="journal-csv">⬇ CSV</button><button class="btn sm" data-act="export" data-kind="journal-json">⬇ JSON</button>
+        </div>
+        <div id="hList"></div>
+      </section>
+      <section class="view hidden" id="v-backtest" aria-label="Backtest"></section>
+      <section class="view hidden" id="v-analytics" aria-label="Analytics"></section>
+      <section class="view hidden" id="v-risk" aria-label="Risiko"></section>
+      <section class="view hidden" id="v-alerts" aria-label="Alarm-Chat"></section>
+      <section class="view hidden" id="v-diagnostics" aria-label="Diagnose"></section>
+      <section class="view hidden" id="v-system" aria-label="System &amp; API Health"></section>
+      <section class="view hidden" id="v-logs" aria-label="Logs">
+        <div class="toolbar">
+          <div class="seg" id="logCats" role="toolbar" aria-label="Log-Filter"></div>
+          <input type="search" id="lq" placeholder="Logs durchsuchen" aria-label="Logs durchsuchen">
+          <button class="btn sm" data-act="export" data-kind="logs-json">⬇ JSON</button>
+          <button class="btn sm" data-act="logsPause" id="btnLogPause">⏸ Anhalten</button>
+        </div>
+        <div class="panel tight" id="logList" style="max-height:70vh;overflow-y:auto"></div>
+      </section>
+      <section class="view hidden" id="v-settings" aria-label="Einstellungen"></section>
+      <section class="view hidden" id="v-knowledge" aria-label="Wissensbasis"></section>
+    </div>
+  </main>
+  <aside class="detail" id="detail" aria-label="Token-Details"></aside>
+</div>
+<div class="backdrop" id="backdrop" data-act="closeDetail"></div>
+<nav class="bottomnav" id="bottomnav" aria-label="Navigation"></nav>
+<div class="toasts" id="toasts" aria-live="assertive"></div>
+<div class="modal" id="modal" hidden role="dialog" aria-modal="true" aria-labelledby="modalTitle"><div class="modal-box"><h2 id="modalTitle"></h2><div id="modalBody"></div><div class="modal-actions" id="modalActions"></div></div></div>
+<div class="ctx" id="ctx" hidden role="menu"></div>
+<noscript><div class="banner bad">Smart Lab benötigt JavaScript.</div></noscript>
+<script src="app.js"></script>
+</body>
+</html>
