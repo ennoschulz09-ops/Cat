@@ -161,6 +161,16 @@ function priceToMc(pos, t, price) {
   const r = posMcRatio(pos, t);
   return (r != null && isNum(price) && price > 0) ? price * r : null;
 }
+/* Für UI-Werte: Mc wenn berechenbar, sonst Fallback auf den Rohpreis (nie ein leerer Wert). */
+function mcOrPrice(pos, t, price) {
+  const m = priceToMc(pos, t, price);
+  return m != null ? fmtMc(m) : fmtPrice(price);
+}
+/* Für Log-/Audit-/Alert-Text (kein Tooltip verfügbar): Mc + exakter Preis in Klammern, sonst nur der Preis. */
+function fmtPriceMc(pos, t, price) {
+  const m = priceToMc(pos, t, price);
+  return m != null ? fmtMc(m) + ' (' + fmtPrice(price) + ')' : fmtPrice(price);
+}
 const fmtSigned = (n, f = fmtUsd) => (!isNum(n) ? '—' : (n > 0 ? '+' : '') + f(n));
 function fmtPct(v, d = 1) { return isNum(v) ? (v > 0 ? '+' : '') + v.toFixed(d) + '%' : '—'; }
 function fmtNum(v, d = 0) { return isNum(v) ? v.toLocaleString('de-DE', { maximumFractionDigits: d, minimumFractionDigits: d }) : '—'; }
@@ -2072,7 +2082,7 @@ function createCore(opts) {
       const qty = (size - fees.total) / fillPrice;
       if (!(qty > 0)) throw new Error('Menge nach Gebühren ≤ 0');
       transition(ord, 'CONFIRMED', 'Simulierte Füllung: Live-Preis + geschätzter Price Impact');
-      ord.fillPrice = fillPrice; ord.qty = qty; ord.fees = fees; ord.priceAt = snap.fetchedAt; ord.latencyMs = env.now() - t0;
+      ord.fillPrice = fillPrice; ord.fillMc = priceToMc(null, t, fillPrice); ord.estMc = priceToMc(null, t, price); ord.qty = qty; ord.fees = fees; ord.priceAt = snap.fetchedAt; ord.latencyMs = env.now() - t0;
       const leadId = lead || D.strategy;
       applyBuyFill(t, ord, A, D, { price: fillPrice, refPrice: price, qty, size, fees, impact, lead: leadId });
       state.risk.buyCount[tokenId] = buyNo;
@@ -2083,9 +2093,9 @@ function createCore(opts) {
       state.usedKeys.set(key, ord.id);
       state.metrics.counters.executed++; state.metrics.minute.executed++; state.metrics.perf.exec = ord.latencyMs;
       stratStat(leadId, 'executed');
-      audit(auto ? 'BOT' : 'USER', 'BUY', `${t.symbol} Buy #${buyNo}: ${fmtUsd(size)} @ ${fmtPrice(fillPrice)} (${state.mode})`, reason || D.reason);
-      log.trade(`${state.mode} BUY #${buyNo} ${t.symbol}: ${fmtUsd(size)} @ ${fmtPrice(fillPrice)} · Impact ${(impact * 100).toFixed(2)} % · Fees ${fmtUsd(fees.total, 4)}`, { order: ord.id });
-      alert('TRADE', t, `${state.mode} BUY #${buyNo}: ${fmtUsd(size)} @ ${fmtPrice(fillPrice)}`, 'SUCCESS', { cooldownMs: 0, key: ord.id });
+      audit(auto ? 'BOT' : 'USER', 'BUY', `${t.symbol} Buy #${buyNo}: ${fmtUsd(size)} @ ${fmtPriceMc(null, t, fillPrice)} (${state.mode})`, reason || D.reason);
+      log.trade(`${state.mode} BUY #${buyNo} ${t.symbol}: ${fmtUsd(size)} @ ${fmtPriceMc(null, t, fillPrice)} · Impact ${(impact * 100).toFixed(2)} % · Fees ${fmtUsd(fees.total, 4)}`, { order: ord.id });
+      alert('TRADE', t, `${state.mode} BUY #${buyNo}: ${fmtUsd(size)} @ ${fmtPriceMc(null, t, fillPrice)}`, 'SUCCESS', { cooldownMs: 0, key: ord.id });
       persistNow(); emit('trade', { order: ord });
       return { ok: true, order: ord };
     } catch (e) {
@@ -2112,7 +2122,7 @@ function createCore(opts) {
       state.positions.unshift(pos);
       journalOpen(pos, t, A, D, o);
     }
-    pos.entries.push({ orderId: o.id, ts: now, price: f.price, refPrice: f.refPrice, qty: f.qty, usd: f.size, fees: f.fees.total, impactPct: f.impact * 100, latencyMs: o.latencyMs });
+    pos.entries.push({ orderId: o.id, ts: now, price: f.price, mc: isNum(A.core.mc) && isNum(A.core.price) && A.core.price > 0 ? f.price * (A.core.mc / A.core.price) : null, refPrice: f.refPrice, qty: f.qty, usd: f.size, fees: f.fees.total, impactPct: f.impact * 100, latencyMs: o.latencyMs });
     const sq = sum(pos.entries.map(e => e.qty));
     pos.entryPrice = sum(pos.entries.map(e => e.price * e.qty)) / sq;
     pos.qty += f.qty; pos.initialQty += f.qty; pos.costUsd += f.size; pos.investedUsd += f.size; pos.feesUsd += f.fees.total;
@@ -2136,7 +2146,7 @@ function createCore(opts) {
   }
   function exitDecision(pos, t, p, pnlPct, liq, now) {
     const s = S(), A = t && t.A;
-    if (p <= pos.stop) return { code: pos.stopType === 'TRAILING' ? 'TRAILING_STOP' : pos.stopType === 'BREAK_EVEN' ? 'BREAK_EVEN' : pos.stopType === 'ATR' ? 'ATR_STOP' : 'STOP_LOSS', frac: 'ALL', detail: `Preis ${fmtPrice(p)} ≤ Stop ${fmtPrice(pos.stop)}` };
+    if (p <= pos.stop) return { code: pos.stopType === 'TRAILING' ? 'TRAILING_STOP' : pos.stopType === 'BREAK_EVEN' ? 'BREAK_EVEN' : pos.stopType === 'ATR' ? 'ATR_STOP' : 'STOP_LOSS', frac: 'ALL', detail: `Preis ${fmtPriceMc(pos, t, p)} ≤ Stop ${fmtPriceMc(pos, t, pos.stop)}` };
     if (isNum(liq) && isNum(pos.entryLiq) && pos.entryLiq > 0 && liq < pos.entryLiq * (1 - s.liqCollapsePct / 100)) return { code: 'LIQUIDITY_COLLAPSE', frac: 'ALL', detail: `Liquidität ${fmtUsd(liq)} (Entry ${fmtUsd(pos.entryLiq)})` };
     if (s.exitOnRiskCritical && A && (A.sec.status === 'CRITICAL' || (A.risk.level === 'CRITICAL' && A.confidence.total >= 50))) return { code: 'RISK_INCREASE', frac: 'ALL', detail: `Risiko ${A.risk.level} (${A.risk.total})` };
     if (pnlPct >= s.tp3Pct) return { code: 'TP3', frac: 'ALL', detail: `+${pnlPct.toFixed(1)} % ≥ TP3` };
@@ -2148,7 +2158,7 @@ function createCore(opts) {
       if (!pos.timeExitFlag) { pos.timeExitFlag = true; alert('SELL_CANDIDATE', t, `Time Exit Candidate: ${pos.symbol} nach ${fmtAge(held)} nur ${fmtPct(pnlPct)}`, 'INFO', { key: 'time' }); }
       if (s.timeExitAuto) return { code: 'TIME_EXIT', frac: 'ALL', detail: `${fmtAge(held)} ohne erwartete Bewegung (${fmtPct(pnlPct)})` };
     }
-    if (p <= pos.stop * 1.03) alert('SELL_CANDIDATE', t, `${pos.symbol} nahe am Stop (${fmtPrice(p)} / Stop ${fmtPrice(pos.stop)})`, 'WARNING', { key: 'nearstop' });
+    if (p <= pos.stop * 1.03) alert('SELL_CANDIDATE', t, `${pos.symbol} nahe am Stop (${fmtPriceMc(pos, t, p)} / Stop ${fmtPriceMc(pos, t, pos.stop)})`, 'WARNING', { key: 'nearstop' });
     return null;
   }
   async function managePositions() {
@@ -2219,7 +2229,7 @@ function createCore(opts) {
       transition(ord, 'CONFIRMED', 'Simulierte Füllung');
       const costPortion = pos.costUsd * (qty / pos.qty);
       const realized = net - costPortion;
-      pos.exits.push({ orderId: ord.id, ts: env.now(), price: fillPrice, refPrice: p, qty, usd: net, fees: fees.total, impactPct: imp * 100, reason: reasonCode, realized });
+      pos.exits.push({ orderId: ord.id, ts: env.now(), price: fillPrice, mc: priceToMc(pos, t, fillPrice), refPrice: p, qty, usd: net, fees: fees.total, impactPct: imp * 100, reason: reasonCode, realized });
       pos.qty -= qty; pos.costUsd -= costPortion;
       if (pos.qty <= pos.initialQty * 1e-9) { pos.qty = 0; pos.costUsd = 0; }
       pos.realizedUsd += realized; pos.feesUsd += fees.total; pos.slippageUsd += qty * (p - fillPrice); pos.exitPending = null;
@@ -2228,12 +2238,12 @@ function createCore(opts) {
       const r = state.risk;
       r.coinCooldown[pos.tokenId] = env.now() + S().sellCooldownMin * MIN;
       r.dailyPnl = m6(r.dailyPnl + realized);
-      ord.sizeUsd = net; ord.qty = qty; ord.fillPrice = fillPrice; ord.estPrice = p; ord.fees = fees; ord.expSlipPct = imp * 100; ord.latencyMs = env.now() - t0; ord.priceAt = es.snap.fetchedAt;
+      ord.sizeUsd = net; ord.qty = qty; ord.fillPrice = fillPrice; ord.fillMc = priceToMc(pos, t, fillPrice); ord.estMc = priceToMc(pos, t, p); ord.estPrice = p; ord.fees = fees; ord.expSlipPct = imp * 100; ord.latencyMs = env.now() - t0; ord.priceAt = es.snap.fetchedAt;
       if (reasonCode === 'TP1') { pos.tpHit[0] = true; if (S().breakEvenAfterTp1 && pos.qty > 0) { const be = pos.costUsd / pos.qty; if (be > pos.stop) { pos.stop = be; pos.stopType = 'BREAK_EVEN'; pos.breakEven = true; } } }
       if (reasonCode === 'TP2') pos.tpHit[1] = true;
       transition(ord, 'COMPLETED', 'Order Receipt erstellt (SIMULATED)');
       state.usedKeys.set(key, ord.id);
-      log.trade(`${pos.mode} SELL ${pos.symbol} (${reasonCode}): ${fmtUsd(net)} @ ${fmtPrice(fillPrice)} · realisiert ${fmtSigned(realized)}`, { order: ord.id });
+      log.trade(`${pos.mode} SELL ${pos.symbol} (${reasonCode}): ${fmtUsd(net)} @ ${fmtPriceMc(pos, t, fillPrice)} · realisiert ${fmtSigned(realized)}`, { order: ord.id });
       audit(auto ? 'BOT' : 'USER', 'SELL', `${pos.symbol} ${reasonCode}: ${fmtUsd(net)} (${fmtSigned(realized)})`, detail);
       if (/STOP|BREAK_EVEN/.test(reasonCode)) alert('STOP_HIT', t, `${pos.symbol}: ${reasonCode} ${detail}`, 'WARNING', { cooldownMs: 0, key: ord.id });
       else if (/^TP/.test(reasonCode)) alert('TP_HIT', t, `${pos.symbol}: ${reasonCode} ${fmtSigned(realized)}`, 'SUCCESS', { cooldownMs: 0, key: ord.id });
@@ -2386,8 +2396,8 @@ function createCore(opts) {
       const w = state.watchlist[t.id];
       if (w && w.alerts) {
         const p = A.core.price;
-        if (isNum(w.priceAbove) && isNum(p) && p >= w.priceAbove) alert('WATCH', t, `Preis ${fmtPrice(p)} ≥ ${fmtPrice(w.priceAbove)}`, 'INFO', { key: 'above' });
-        if (isNum(w.priceBelow) && isNum(p) && p <= w.priceBelow) alert('WATCH', t, `Preis ${fmtPrice(p)} ≤ ${fmtPrice(w.priceBelow)}`, 'WARNING', { key: 'below' });
+        if (isNum(w.priceAbove) && isNum(p) && p >= w.priceAbove) alert('WATCH', t, `Preis ${fmtPriceMc(null, t, p)} ≥ ${fmtPriceMc(null, t, w.priceAbove)}`, 'INFO', { key: 'above' });
+        if (isNum(w.priceBelow) && isNum(p) && p <= w.priceBelow) alert('WATCH', t, `Preis ${fmtPriceMc(null, t, p)} ≤ ${fmtPriceMc(null, t, w.priceBelow)}`, 'WARNING', { key: 'below' });
         if (isNum(w.scoreAbove) && A.finalScore >= w.scoreAbove) alert('WATCH', t, `Score ${A.finalScore} ≥ ${w.scoreAbove}`, 'INFO', { key: 'score' });
       }
     }
@@ -3829,7 +3839,7 @@ function renderTiles() {
 
 /* ---------- Scanner-Ansicht (Live Market Table, keyed Rows) ---------- */
 const SORTS = [['score', 'Score', t => t.A.finalScore], ['mom', '5m 🚀', t => t.A.price.chg.m5], ['chg', '1h %', t => t.A.price.chg.h1], ['vol', 'Volumen', t => t.A.vol.h1], ['liq', 'Liquidität', t => t.A.liq.usd], ['momentum', 'Momentum', t => t.A.price.momentum], ['risk', 'Risiko', t => t.A.risk.total], ['conf', 'Confidence', t => t.A.confidence.total], ['opp', 'Opportunity', t => t.A.opportunity], ['age', 'Neu', t => t.A.core.pairAge]];
-const HEAD = [['', null], ['Token', null], ['Preis', null, 'r'], ['5m', 'mom', 'r'], ['1h', 'chg', 'r'], ['Liq', 'liq', 'r'], ['Vol 1h', 'vol', 'r c-vol'], ['K/V 1h', null, 'r c-bs'], ['Mom.', 'momentum', 'r c-mom'], ['Risk', 'risk'], ['Conf', 'conf', 'r'], ['Score', 'score'], ['Status', null], ['Trend', null, 'c-spark'], ['', null]];
+const HEAD = [['', null], ['Token', null], ['Mc', null, 'r'], ['5m', 'mom', 'r'], ['1h', 'chg', 'r'], ['Liq', 'liq', 'r'], ['Vol 1h', 'vol', 'r c-vol'], ['K/V 1h', null, 'r c-bs'], ['Mom.', 'momentum', 'r c-mom'], ['Risk', 'risk'], ['Conf', 'conf', 'r'], ['Score', 'score'], ['Status', null], ['Trend', null, 'c-spark'], ['', null]];
 function passesFilter(t, q, S) {
   const A = t.A, D = t.D;
   if (q && !(t.symbol.toLowerCase().includes(q) || (t.name || '').toLowerCase().includes(q) || t.mint.toLowerCase().includes(q))) return false;
@@ -3844,7 +3854,7 @@ function rowHtml(t) {
   const A = t.A, D = t.D, c = A.price.chg, w = !!core.state.watchlist[t.id];
   return html`<button class="star ${w ? 'on' : ''}" data-act="star" data-id="${t.id}" aria-label="${w ? 'Von Watchlist entfernen' : 'Zur Watchlist hinzufügen'}">${w ? '★' : '☆'}</button>
 <div class="tok"><b>${t.symbol}</b><small>${t.name}</small><span class="flags">${A.flags.map(f => html`<span class="f ${f === 'BOOST' ? 'B' : f === 'PUMP' || f === 'DUMP' ? 'X' : ''}">${f}</span>`)}</span>${A.label !== 'LIVE' ? html` ${lbl(A.label)}` : ''}</div>
-<div class="cell num r" title="${A.core.priceRaw || ''}">${fmtPrice(A.core.price)}</div>
+<div class="cell num r" title="${A.core.priceRaw || ''}">${isNum(A.core.mc) ? fmtMc(A.core.mc) : fmtPrice(A.core.price)}</div>
 <div class="cell num r ${cls(c.m5)}">${fmtPct(c.m5, 0)}</div>
 <div class="cell num r ${cls(c.h1)}">${fmtPct(c.h1, 0)}</div>
 <div class="cell num r">${fmtUsd(A.liq.usd)}</div>
@@ -4021,14 +4031,14 @@ function renderPositions(sec) {
 function renderOrders(sec) {
   const os = core.state.orders.slice(0, 120);
   patch(sec, html`<h2>🧾 Orders</h2><p class="note">Jede Order hat eine eindeutige ID und Idempotency-Key. Tx: nur echte Signaturen würden verlinkt – im Simulationsmodus existiert keine Transaktion.</p>
-    <div class="panel tw">${os.length ? html`<table class="tbl"><thead><tr><th>Zeit</th><th>Token</th><th>Typ</th><th class="r">Größe</th><th class="r">Preis</th><th>Status</th><th>Tx</th><th>Grund</th></tr></thead><tbody>
-    ${os.map(o => html`<tr class="click" data-act="order" data-id="${o.id}"><td class="num">${fmtTime(o.createdAt)}</td><td><b>${o.symbol}</b></td><td>${o.side} <small class="mut">${o.auto ? 'Bot' : 'manuell'} · ${o.mode}</small></td><td class="r num">${o.sizeUsd != null ? fmtUsd(o.sizeUsd) : '—'}</td><td class="r num">${o.fillPrice != null ? fmtPrice(o.fillPrice) : '—'}</td><td><span class="chip ${o.state === 'COMPLETED' ? 'ok' : o.state === 'REJECTED' || o.state === 'FAILED' ? 'bad' : o.state === 'CANCELLED' ? '' : 'info'}">${o.state}</span></td><td class="mut">${o.txSig ? 'Tx' : 'SIMULIERT'}</td><td class="mut">${(o.blockers && o.blockers[0] ? o.blockers[0].code + ': ' : '') + (o.reason || '').slice(0, 80)}</td></tr>`)}
+    <div class="panel tw">${os.length ? html`<table class="tbl"><thead><tr><th>Zeit</th><th>Token</th><th>Typ</th><th class="r">Größe</th><th class="r">Mc</th><th>Status</th><th>Tx</th><th>Grund</th></tr></thead><tbody>
+    ${os.map(o => html`<tr class="click" data-act="order" data-id="${o.id}"><td class="num">${fmtTime(o.createdAt)}</td><td><b>${o.symbol}</b></td><td>${o.side} <small class="mut">${o.auto ? 'Bot' : 'manuell'} · ${o.mode}</small></td><td class="r num">${o.sizeUsd != null ? fmtUsd(o.sizeUsd) : '—'}</td><td class="r num"><span title="${o.fillPrice != null ? fmtPrice(o.fillPrice) : ''}">${o.fillPrice != null ? (isNum(o.fillMc) ? fmtMc(o.fillMc) : fmtPrice(o.fillPrice)) : '—'}</span></td><td><span class="chip ${o.state === 'COMPLETED' ? 'ok' : o.state === 'REJECTED' || o.state === 'FAILED' ? 'bad' : o.state === 'CANCELLED' ? '' : 'info'}">${o.state}</span></td><td class="mut">${o.txSig ? 'Tx' : 'SIMULIERT'}</td><td class="mut">${(o.blockers && o.blockers[0] ? o.blockers[0].code + ': ' : '') + (o.reason || '').slice(0, 80)}</td></tr>`)}
     </tbody></table>` : html`<div class="empty">Noch keine Orders.</div>`}</div>`);
 }
 function orderModal(id) {
   const o = core.state.orders.find(x => x.id === id); if (!o) return;
   openModal({ title: 'Order Receipt · ' + o.id, body: html`
-    <div class="grid2">${kv('Token', o.symbol)}${kv('Seite', o.side + (o.buyNo ? ' #' + o.buyNo : ''))}${kv('Status', o.state)}${kv('Modus', o.mode)}${kv('Größe', o.sizeUsd != null ? fmtUsd(o.sizeUsd) : '—')}${kv('Menge', o.qty != null ? fmtNum(o.qty, 2) : '—')}${kv('Referenzpreis', fmtPrice(o.estPrice))}${kv('Füllpreis', fmtPrice(o.fillPrice), o.fillPrice ? 'SIMULATED' : null)}${kv('Price Impact', isNum(o.expSlipPct) ? o.expSlipPct.toFixed(3) + '%' : '—', 'ESTIMATED')}${kv('Fees', o.fees ? fmtUsd(o.fees.total, 4) : '—', 'ESTIMATED')}${kv('Latenz', o.latencyMs != null ? o.latencyMs + ' ms' : '—')}${kv('Transaktion', 'keine (Simulation)')}</div>
+    <div class="grid2">${kv('Token', o.symbol)}${kv('Seite', o.side + (o.buyNo ? ' #' + o.buyNo : ''))}${kv('Status', o.state)}${kv('Modus', o.mode)}${kv('Größe', o.sizeUsd != null ? fmtUsd(o.sizeUsd) : '—')}${kv('Menge', o.qty != null ? fmtNum(o.qty, 2) : '—')}${kv('Referenz (Mc)', isNum(o.estMc) ? fmtMc(o.estMc) : fmtPrice(o.estPrice), null, fmtPrice(o.estPrice))}${kv('Füllung (Mc)', isNum(o.fillMc) ? fmtMc(o.fillMc) : fmtPrice(o.fillPrice), o.fillPrice ? 'SIMULATED' : null, fmtPrice(o.fillPrice))}${kv('Price Impact', isNum(o.expSlipPct) ? o.expSlipPct.toFixed(3) + '%' : '—', 'ESTIMATED')}${kv('Fees', o.fees ? fmtUsd(o.fees.total, 4) : '—', 'ESTIMATED')}${kv('Latenz', o.latencyMs != null ? o.latencyMs + ' ms' : '—')}${kv('Transaktion', 'keine (Simulation)')}</div>
     <p class="note mono">Mint: ${o.mint} · Key: ${o.key || '—'}</p>
     ${o.blockers ? html`<h3>Blocker</h3>${o.blockers.map(b => html`<div class="check"><span class="ic fail">P${b.prio}</span><div><b>${b.code}</b><small>${b.msg}</small></div></div>`)}` : ''}
     <h3>State Machine</h3><ul class="trace">${o.history.map(h => html`<li><b>${fmtTime(h.ts)}</b><span>${h.s}${h.note ? ' – ' + h.note : ''}</span></li>`)}</ul>
@@ -4055,9 +4065,9 @@ function tradeModal(id) {
     <div>${j.signals.map(s => html`<span class="sig" title="${s.reason}">${SIGNAL_NAMES[s.type] || s.type} <i>${s.strength}</i></span>`)}</div>
     <div>${(j.tags || []).map(x => html`<span class="chip info">${x}</span> `)}</div>
     ${d.trace ? html`<h3>Decision Trace</h3><ul class="trace">${d.trace.map(x => html`<li><span class="ic">${x.ok === true ? '✅' : x.ok === false ? '❌' : '·'}</span><b>${x.stage}</b><span>${x.detail}</span></li>`)}</ul>` : ''}
-    <h3>Ausführungen</h3><table class="tbl"><tr><th>Zeit</th><th>Typ</th><th class="r">Preis</th><th class="r">USD</th><th class="r">Fees</th><th>Grund</th></tr>
-    ${j.entries.map(e => html`<tr><td class="num">${fmtTime(e.ts)}</td><td>BUY</td><td class="r num">${fmtPrice(e.price)}</td><td class="r num">${fmtUsd(e.usd)}</td><td class="r num">${fmtUsd(e.fees, 4)}</td><td>—</td></tr>`)}
-    ${j.exits.map(e => html`<tr><td class="num">${fmtTime(e.ts)}</td><td>SELL</td><td class="r num">${fmtPrice(e.price)}</td><td class="r num">${fmtUsd(e.usd)}</td><td class="r num">${fmtUsd(e.fees, 4)}</td><td>${e.reason} (${fmtSigned(e.realized)})</td></tr>`)}</table>` });
+    <h3>Ausführungen</h3><table class="tbl"><tr><th>Zeit</th><th>Typ</th><th class="r">Mc</th><th class="r">USD</th><th class="r">Fees</th><th>Grund</th></tr>
+    ${j.entries.map(e => html`<tr><td class="num">${fmtTime(e.ts)}</td><td>BUY</td><td class="r num" title="${fmtPrice(e.price)}">${isNum(e.mc) ? fmtMc(e.mc) : fmtPrice(e.price)}</td><td class="r num">${fmtUsd(e.usd)}</td><td class="r num">${fmtUsd(e.fees, 4)}</td><td>—</td></tr>`)}
+    ${j.exits.map(e => html`<tr><td class="num">${fmtTime(e.ts)}</td><td>SELL</td><td class="r num" title="${fmtPrice(e.price)}">${isNum(e.mc) ? fmtMc(e.mc) : fmtPrice(e.price)}</td><td class="r num">${fmtUsd(e.usd)}</td><td class="r num">${fmtUsd(e.fees, 4)}</td><td>${e.reason} (${fmtSigned(e.realized)})</td></tr>`)}</table>` });
 }
 
 /* ---------- Backtest Lab ---------- */
@@ -4326,7 +4336,7 @@ function detailHead(t) {
   return html`<div class="dhead"><div style="min-width:0"><h2>${t.symbol} <small class="mut">${t.name}</small></h2>
     <div class="row" style="margin-top:4px">${decChip(D.decision)}${scoreChip(A.finalScore)}${lvlChip(A.risk.level, A.risk.total)}<span class="chip info" title="Data Confidence">Conf ${A.confidence.total}%</span><span class="chip">${A.ageClass}</span>${lbl(A.label)}</div></div>
     <button class="dclose" data-act="closeDetail" aria-label="Details schließen">✕</button></div>
-    <div class="row" style="margin-top:8px"><b class="num" style="font-size:21px" title="${A.core.priceRaw || ''}">${fmtPrice(A.core.price)}</b><span class="num ${cls(c.m5)}">5m ${fmtPct(c.m5)}</span><span class="num ${cls(c.h1)}">1h ${fmtPct(c.h1)}</span><span class="num ${cls(c.h24)}">24h ${fmtPct(c.h24)}</span><span class="mut">· ${A.dataAge != null ? fmtAge(A.dataAge) + ' alt' : ''} · ${A.core.source || '—'}</span></div>
+    <div class="row" style="margin-top:8px"><b class="num" style="font-size:21px" title="${A.core.priceRaw || ''}">${isNum(A.core.mc) ? fmtMc(A.core.mc) : fmtPrice(A.core.price)}</b><span class="num ${cls(c.m5)}">5m ${fmtPct(c.m5)}</span><span class="num ${cls(c.h1)}">1h ${fmtPct(c.h1)}</span><span class="num ${cls(c.h24)}">24h ${fmtPct(c.h24)}</span><span class="mut">· ${A.dataAge != null ? fmtAge(A.dataAge) + ' alt' : ''} · ${A.core.source || '—'}</span></div>
     <button class="ca" data-act="copy" data-v="${t.mint}" data-l="Mint"><code>${t.mint}</code><span>⧉ Mint</span></button>
     <div class="row" style="margin-top:8px"><button class="btn sm ${w ? 'on' : ''}" data-act="star" data-id="${t.id}">${w ? '★ Watchlist' : '☆ Watchlist'}</button><button class="btn sm pri" data-act="buy" data-id="${t.id}">💱 Simulate Buy</button><button class="btn sm" data-act="analyze" data-id="${t.id}">🔍 Neu analysieren</button><button class="btn sm" data-act="ctx" data-id="${t.id}" aria-label="Weitere Aktionen">⋯</button></div>`;
 }
@@ -4342,7 +4352,7 @@ function tabOverview(t) {
     ${kv('Pair-Alter', fmtAge(A.core.pairAge))}${kv('DEX', A.core.dexId || '—')}${kv('Top-10 Holder', A.sec.top10Pct != null ? A.sec.top10Pct.toFixed(1) + '%' : '—', A.labels.holders)}</div>
     <h3>Opportunity vs. Risk vs. Confidence</h3>
     ${meterRow('Opportunity', A.opportunity, 'var(--green)')}${meterRow('Risk', A.risk.total, riskColor(A.risk.total))}${meterRow('Confidence', A.confidence.total, 'var(--cyan)')}${meterRow('Execution', A.executionScore, 'var(--violet)')}
-    <h3>Technische Analyse ${A.ta ? lbl(A.ta.label) : ''}</h3>${A.ta ? html`<div class="grid3">${kv('EMA 9', fmtPrice(A.ta.ema9))}${kv('EMA 21', fmtPrice(A.ta.ema21))}${kv('SMA 20', fmtPrice(A.ta.sma20))}${kv('RSI 14', A.ta.rsi != null ? A.ta.rsi.toFixed(0) : '—')}${kv('ATR %', A.ta.atrPct != null ? A.ta.atrPct.toFixed(2) + '%' : '—')}${kv('ROC 10', fmtPct(A.ta.roc))}${kv('VWAP', fmtPrice(A.ta.vwap))}${kv('Momentum', A.price.momentum)}${kv('Trend', A.price.trend)}</div><p class="note">Quelle: ${A.ta.source}. Indikatoren unterstützen Entscheidungen, ersetzen aber keine Risikoanalyse.</p>` : html`<p class="mut">Nicht genug Datenpunkte (mind. 15 Live-Samples oder frische 1m-OHLCV via Chart-Tab).</p>`}
+    <h3>Technische Analyse ${A.ta ? lbl(A.ta.label) : ''}</h3>${A.ta ? html`<div class="grid3">${kv('EMA 9', mcOrPrice(null, t, A.ta.ema9))}${kv('EMA 21', mcOrPrice(null, t, A.ta.ema21))}${kv('SMA 20', mcOrPrice(null, t, A.ta.sma20))}${kv('RSI 14', A.ta.rsi != null ? A.ta.rsi.toFixed(0) : '—')}${kv('ATR %', A.ta.atrPct != null ? A.ta.atrPct.toFixed(2) + '%' : '—')}${kv('ROC 10', fmtPct(A.ta.roc))}${kv('VWAP', mcOrPrice(null, t, A.ta.vwap))}${kv('Momentum', A.price.momentum)}${kv('Trend', A.price.trend)}</div><p class="note">Quelle: ${A.ta.source}. Indikatoren unterstützen Entscheidungen, ersetzen aber keine Risikoanalyse.</p>` : html`<p class="mut">Nicht genug Datenpunkte (mind. 15 Live-Samples oder frische 1m-OHLCV via Chart-Tab).</p>`}
     <h3>Signale</h3>${A.signals.length ? A.signals.map(s => html`<div class="check"><span class="ic ${CONTEXT_SIGNALS.has(s.type) ? 'na' : 'pass'}">${s.strength}</span><div><b>${SIGNAL_NAMES[s.type]}</b><small>${s.reason} · Confidence ${s.confidence}</small></div></div>`) : html`<p class="mut">Keine Signale aktiv.</p>`}
     ${A.flags.length ? html`<h3>Flags</h3><div class="row">${A.flags.map(f => html`<span class="f ${f === 'BOOST' ? 'B' : f === 'PUMP' || f === 'DUMP' ? 'X' : ''}">${f}</span>`)}</div>` : ''}
     <h3>Links</h3><div class="lk">${linkHtml(tokenLinks(t))}</div>
@@ -4361,7 +4371,7 @@ function tabRisk(t) {
     <p class="note">Beobachtungen, keine Sicherheitsgarantie. Holder-Daten via RPC enthalten Pool-Konten.</p><button class="btn sm" data-act="secRecheck" data-id="${t.id}">🛡 Security neu prüfen</button>
     ${A.pump.flags.length ? html`<h3>Pump / Manipulation</h3>${A.pump.flags.map(f => html`<div class="check"><span class="ic warn">!</span><div>${f}</div></div>`)}` : ''}
     ${A.vol.anomalies.length ? html`<h3>Volumen-Anomalien</h3>${A.vol.anomalies.map(f => html`<div class="check"><span class="ic warn">!</span><div>${f}</div></div>`)}` : ''}
-    <h3>Datenkonflikte</h3>${A.conflicts.length ? A.conflicts.map(c => html`<div class="check"><span class="ic fail">KONFLIKT</span><div><b>${c.field}</b><small>DexScreener ${c.field === 'Preis' ? fmtPrice(c.a) : fmtUsd(c.a)} vs. GeckoTerminal ${c.field === 'Preis' ? fmtPrice(c.b) : fmtUsd(c.b)} (${c.diffPct.toFixed(1)} %)</small></div></div>`) : html`<p class="mut">${A.crossChecked ? 'Cross-Check mit GeckoTerminal: keine Konflikte' + (A.crossPriceDiff != null ? ` (Δ Preis ${A.crossPriceDiff.toFixed(2)} %)` : '') : 'Kein Cross-Check verfügbar (Zweitquelle fehlt/nicht zeitgleich).'}</p>`}
+    <h3>Datenkonflikte</h3>${A.conflicts.length ? A.conflicts.map(c => html`<div class="check"><span class="ic fail">KONFLIKT</span><div><b>${c.field}</b><small>DexScreener ${c.field === 'Preis' ? mcOrPrice(null, t, c.a) : fmtUsd(c.a)} vs. GeckoTerminal ${c.field === 'Preis' ? mcOrPrice(null, t, c.b) : fmtUsd(c.b)} (${c.diffPct.toFixed(1)} %)</small></div></div>`) : html`<p class="mut">${A.crossChecked ? 'Cross-Check mit GeckoTerminal: keine Konflikte' + (A.crossPriceDiff != null ? ` (Δ Preis ${A.crossPriceDiff.toFixed(2)} %)` : '') : 'Kein Cross-Check verfügbar (Zweitquelle fehlt/nicht zeitgleich).'}</p>`}
     <h3>Data Quality</h3><table class="tbl">${q.map(r => html`<tr><td>${r[0]}</td><td>${lbl(r[1])}</td><td class="num">${r[2] != null ? fmtAge(r[2]) : '—'}</td><td class="mut">${r[3]}</td></tr>`)}</table>`;
 }
 function tabPlan(t) {
@@ -4373,12 +4383,12 @@ function tabPlan(t) {
   const exitImp = sz && sz.size > 0 ? core.estImpact(sz.size, A.liq.usd) : null;
   const autoB = t.D.blockers;
   return html`<h3 style="margin-top:0">Execution Preview <span class="lbl SIMULATED">${core.state.mode}</span></h3>
-    <div class="grid2">${kv('Token', t.symbol)}${kv('Seite', 'BUY')}${kv('Vorgeschlagene Größe', sz && sz.size > 0 ? fmtUsd(sz.size) : '0', 'ESTIMATED')}${kv('begrenzt durch', (sz && sz.capBy) || '—')}${kv('Geschätzter Preis', fmtPrice(p), A.label)}${kv('Erw. Price Impact', sz && isNum(sz.impactPct) ? sz.impactPct.toFixed(3) + '%' : '—', 'ESTIMATED')}${kv('Gebühren gesamt', sz && sz.fees ? fmtUsd(sz.fees.total, 4) : '—', 'ESTIMATED')}${kv('Max. Price Impact', S.maxSlippagePct + '%')}</div>
+    <div class="grid2">${kv('Token', t.symbol)}${kv('Seite', 'BUY')}${kv('Vorgeschlagene Größe', sz && sz.size > 0 ? fmtUsd(sz.size) : '0', 'ESTIMATED')}${kv('begrenzt durch', (sz && sz.capBy) || '—')}${kv('Geschätzter Preis', isNum(A.core.mc) ? fmtMc(A.core.mc) : fmtPrice(p), A.label, fmtPrice(p))}${kv('Erw. Price Impact', sz && isNum(sz.impactPct) ? sz.impactPct.toFixed(3) + '%' : '—', 'ESTIMATED')}${kv('Gebühren gesamt', sz && sz.fees ? fmtUsd(sz.fees.total, 4) : '—', 'ESTIMATED')}${kv('Max. Price Impact', S.maxSlippagePct + '%')}</div>
     ${sz && sz.fees ? html`<p class="note">Fees: Netzwerk ${fmtUsd(sz.fees.network, 5)} + Priority ${fmtUsd(sz.fees.priority, 5)} (${sz.fees.lamports} Lamports @ SOL ${fmtUsd(sz.fees.solUsd)}) + DEX ${fmtUsd(sz.fees.dex, 4)}</p>` : ''}
     ${sz && sz.factors && sz.factors.caps ? html`<p class="note">Sizing: Basis ${sz.factors.basePct}% · Risk-Faktor ${sz.factors.fRisk} · Confidence-Faktor ${sz.factors.fConf} · Volatilitäts-Faktor ${sz.factors.fVol} · Limits: ${Object.entries(sz.factors.caps).map(([k, v]) => k + ' ' + fmtUsd(v)).join(', ')}</p>` : sz && sz.reason ? html`<p class="note warn">${sz.reason}</p>` : ''}
-    <h3>Trade Plan</h3><div class="grid2">${kv('Stop Loss (' + S.stopLossPct + '%)', fmtPrice(p ? p * (1 - S.stopLossPct / 100) : null))}${kv('ATR-Stop (' + S.atrMult + '× ATR)', a14 && p ? fmtPrice(p - S.atrMult * a14) : 'ATR n/v', a14 ? 'LIVE' : 'UNKNOWN')}${kv('TP1 +' + S.tp1Pct + '% (' + Math.round(S.tp1Frac * 100) + '%)', fmtPrice(p ? p * (1 + S.tp1Pct / 100) : null))}${kv('TP2 +' + S.tp2Pct + '% (' + Math.round(S.tp2Frac * 100) + '%)', fmtPrice(p ? p * (1 + S.tp2Pct / 100) : null))}${kv('TP3 +' + S.tp3Pct + '% (Rest)', fmtPrice(p ? p * (1 + S.tp3Pct / 100) : null))}${kv('Trailing', 'ab +' + S.trailActivatePct + '%, Abstand ' + S.trailPct + '%')}${kv('Time Exit', S.timeExitMin + ' min < ' + S.timeExitMinPnlPct + '%')}${kv('Break-even nach TP1', S.breakEvenAfterTp1 ? 'ja' : 'nein')}</div>
+    <h3>Trade Plan</h3><div class="grid2">${kv('Stop Loss (' + S.stopLossPct + '%)', mcOrPrice(null, t, p ? p * (1 - S.stopLossPct / 100) : null))}${kv('ATR-Stop (' + S.atrMult + '× ATR)', a14 && p ? mcOrPrice(null, t, p - S.atrMult * a14) : 'ATR n/v', a14 ? 'LIVE' : 'UNKNOWN')}${kv('TP1 +' + S.tp1Pct + '% (' + Math.round(S.tp1Frac * 100) + '%)', mcOrPrice(null, t, p ? p * (1 + S.tp1Pct / 100) : null))}${kv('TP2 +' + S.tp2Pct + '% (' + Math.round(S.tp2Frac * 100) + '%)', mcOrPrice(null, t, p ? p * (1 + S.tp2Pct / 100) : null))}${kv('TP3 +' + S.tp3Pct + '% (Rest)', mcOrPrice(null, t, p ? p * (1 + S.tp3Pct / 100) : null))}${kv('Trailing', 'ab +' + S.trailActivatePct + '%, Abstand ' + S.trailPct + '%')}${kv('Time Exit', S.timeExitMin + ' min < ' + S.timeExitMinPnlPct + '%')}${kv('Break-even nach TP1', S.breakEvenAfterTp1 ? 'ja' : 'nein')}</div>
     <h3>Liquidity Exit Test</h3><div class="grid2">${kv('Verfügbare Liquidität', fmtUsd(A.liq.usd))}${kv('Exit-Liquidität (Quote-Seite)', fmtUsd(A.liq.exitLiqUsd), 'ESTIMATED')}${kv('Erw. Exit-Slippage', exitImp != null ? (exitImp * 100).toFixed(3) + '%' : '—', 'ESTIMATED')}${kv('Exit Risk', A.liq.slipRisk)}</div>
-    ${pos ? html`<p class="note info">Offene Position: ${fmtUsd(pos.costUsd)} · Entry ${fmtPrice(pos.entryPrice)} · PnL ${isNum(pos.pnlUsd) ? fmtSigned(pos.pnlUsd) : 'n/v'}</p>` : ''}
+    ${pos ? html`<p class="note info">Offene Position: ${fmtUsd(pos.costUsd)} · Entry ${mcOrPrice(pos, t, pos.entryPrice)} · PnL ${isNum(pos.pnlUsd) ? fmtSigned(pos.pnlUsd) : 'n/v'}</p>` : ''}
     <h3>Blocker (manuell)</h3>${ex.blockers.length ? ex.blockers.map(b => html`<div class="check"><span class="ic fail">P${b.prio}</span><div><b>${b.code}</b><small>${b.msg}</small></div></div>`) : html`<p class="ok">Keine Ausführungs-Blocker für einen manuellen Sim-Kauf (harte Regeln werden beim Kauf erneut geprüft).</p>`}
     <h3>Blocker (Auto-Bot)</h3>${autoB.length ? autoB.slice(0, 8).map(b => html`<span class="blk p${b.prio}" title="${b.msg}">${b.code}</span>`) : html`<p class="ok">Keine – Token wäre für den Bot freigegeben.</p>`}
     <div class="row" style="margin-top:10px"><button class="btn pri" data-act="buy" data-id="${t.id}">💱 Sim-Kauf vorbereiten</button></div>
@@ -4514,7 +4524,7 @@ function drawChart() {
   const step = plotW / vis.length;
   const X = i => 4 + (i + 0.5) * step, Y = v => padT + (1 - (v - lo) / (hi - lo)) * plotH;
   c.font = '10px ui-monospace,monospace'; c.textAlign = 'left'; c.textBaseline = 'middle';
-  for (let k = 0; k <= 4; k++) { const v = lo + (hi - lo) * k / 4, y = Y(v); c.strokeStyle = grid; c.beginPath(); c.moveTo(4, y); c.lineTo(4 + plotW, y); c.stroke(); c.fillStyle = muted; c.fillText(fmtPrice(v), 8 + plotW, y); }
+  for (let k = 0; k <= 4; k++) { const v = lo + (hi - lo) * k / 4, y = Y(v); c.strokeStyle = grid; c.beginPath(); c.moveTo(4, y); c.lineTo(4 + plotW, y); c.stroke(); c.fillStyle = muted; c.fillText(mcOrPrice(null, t, v), 8 + plotW, y); }
   if (volH) { const vm = Math.max(...vis.map(p => p.v || 0)) || 1; vis.forEach((p, i) => { const bh = (p.v || 0) / vm * (volH - 6); c.fillStyle = p.c >= p.o ? '#22e58f44' : '#ff547044'; c.fillRect(X(i) - step * 0.35, h - 14 - bh, Math.max(1, step * 0.7), bh); }); }
   if (d.kind === 'candle') {
     vis.forEach((p, i) => { const up = p.c >= p.o; c.strokeStyle = c.fillStyle = up ? '#22e58f' : '#ff5470'; c.beginPath(); c.moveTo(X(i), Y(p.h)); c.lineTo(X(i), Y(p.l)); c.stroke(); const y1 = Y(Math.max(p.o, p.c)), y2 = Y(Math.min(p.o, p.c)); c.fillRect(X(i) - Math.max(1, step * 0.33), y1, Math.max(2, step * 0.66), Math.max(1, y2 - y1)); });
@@ -4532,7 +4542,7 @@ function drawChart() {
     const i = clamp(Math.floor((hv.x - 4) / step), 0, vis.length - 1), p = vis[i];
     c.strokeStyle = '#ffffff44'; c.beginPath(); c.moveTo(X(i), padT); c.lineTo(X(i), h - 14); c.stroke();
     tip.style.display = 'block';
-    setHTML(tip, d.kind === 'candle' ? html`${fmtDateTime(p.t)}<br>O ${fmtPrice(p.o)} H ${fmtPrice(p.h)}<br>L ${fmtPrice(p.l)} C ${fmtPrice(p.c)}<br>Vol ${fmtUsd(p.v)}` : html`${fmtTime(p.t)}<br>${fmtPrice(p.c)}`);
+    setHTML(tip, d.kind === 'candle' ? html`${fmtDateTime(p.t)}<br>O ${mcOrPrice(null, t, p.o)} H ${mcOrPrice(null, t, p.h)}<br>L ${mcOrPrice(null, t, p.l)} C ${mcOrPrice(null, t, p.c)}<br>Vol ${fmtUsd(p.v)}` : html`${fmtTime(p.t)}<br>${mcOrPrice(null, t, p.c)}`);
     tip.style.left = Math.min(w - 150, Math.max(4, X(i) + 10)) + 'px'; tip.style.top = '8px';
   } else if (tip) tip.style.display = 'none';
 }
@@ -4627,7 +4637,7 @@ function buyPreviewHtml(t, size) {
   const S = core.S();
   const ex = core.execCheck(t, { auto: false, preTrade: false, sizeUsd: size });
   const sz = ex.sizing || {}, A = t.A;
-  return html`<div class="grid2">${kv('Token', t.symbol)}${kv('Seite', 'BUY #' + ((core.state.risk.buyCount[t.id] || 0) + 1) + ' / ' + Math.min(S.maxBuysPerCoin, 2))}${kv('Modus', core.state.mode, 'SIMULATED')}${kv('Geschätzter Preis', fmtPrice(A.core.price), A.label)}${kv('Erw. Price Impact', isNum(sz.impactPct) ? sz.impactPct.toFixed(3) + '%' : '—', 'ESTIMATED')}${kv('Max. Price Impact', S.maxSlippagePct + '%')}${kv('Gebühren', sz.fees ? fmtUsd(sz.fees.total, 4) : '—', 'ESTIMATED')}${kv('Risk / Confidence', A.risk.level + ' ' + A.risk.total + ' / ' + A.confidence.total + '%')}</div>
+  return html`<div class="grid2">${kv('Token', t.symbol)}${kv('Seite', 'BUY #' + ((core.state.risk.buyCount[t.id] || 0) + 1) + ' / ' + Math.min(S.maxBuysPerCoin, 2))}${kv('Modus', core.state.mode, 'SIMULATED')}${kv('Geschätzter Preis', isNum(A.core.mc) ? fmtMc(A.core.mc) : fmtPrice(A.core.price), A.label, fmtPrice(A.core.price))}${kv('Erw. Price Impact', isNum(sz.impactPct) ? sz.impactPct.toFixed(3) + '%' : '—', 'ESTIMATED')}${kv('Max. Price Impact', S.maxSlippagePct + '%')}${kv('Gebühren', sz.fees ? fmtUsd(sz.fees.total, 4) : '—', 'ESTIMATED')}${kv('Risk / Confidence', A.risk.level + ' ' + A.risk.total + ' / ' + A.confidence.total + '%')}</div>
     ${ex.blockers.length ? html`<h3>Blocker</h3>${ex.blockers.map(b => html`<div class="check"><span class="ic fail">P${b.prio}</span><div><b>${b.code}</b><small>${b.msg}</small></div></div>`)}` : html`<p class="ok">Vorabprüfung ok. Beim Bestätigen werden Daten frisch geladen und alle harten Regeln erneut geprüft (Pre-Trade-Check).</p>`}
     <p class="note">Simulation: keine echte Order, keine Transaktion. Füllung zum Live-Preis + geschätztem Impact, Gebühren geschätzt.</p>`;
 }
@@ -4658,7 +4668,7 @@ async function openBuyInner(id) {
   scheduleRender(true);
 }
 function receiptModal(o) {
-  openModal({ title: 'Order Receipt (SIMULATED)', body: html`<div class="grid2">${kv('Order ID', o.id)}${kv('Status', o.state)}${kv('Token', o.symbol)}${kv('Seite', o.side)}${kv('Füllpreis', fmtPrice(o.fillPrice), 'SIMULATED')}${kv('Größe', fmtUsd(o.sizeUsd))}${kv('Menge', fmtNum(o.qty, 2))}${kv('Fees', o.fees ? fmtUsd(o.fees.total, 4) : '—', 'ESTIMATED')}${kv('Zeit', fmtDateTime(o.history[o.history.length - 1].ts))}${kv('Transaktion', 'keine – Simulation')}</div><p class="note">Kein Explorer-Link: es existiert keine echte Transaktions-Signatur.</p>` });
+  openModal({ title: 'Order Receipt (SIMULATED)', body: html`<div class="grid2">${kv('Order ID', o.id)}${kv('Status', o.state)}${kv('Token', o.symbol)}${kv('Seite', o.side)}${kv('Füllpreis', isNum(o.fillMc) ? fmtMc(o.fillMc) : fmtPrice(o.fillPrice), 'SIMULATED', fmtPrice(o.fillPrice))}${kv('Größe', fmtUsd(o.sizeUsd))}${kv('Menge', fmtNum(o.qty, 2))}${kv('Fees', o.fees ? fmtUsd(o.fees.total, 4) : '—', 'ESTIMATED')}${kv('Zeit', fmtDateTime(o.history[o.history.length - 1].ts))}${kv('Transaktion', 'keine – Simulation')}</div><p class="note">Kein Explorer-Link: es existiert keine echte Transaktions-Signatur.</p>` });
 }
 async function openSell(posId, frac) {
   const p = core.state.positions.find(x => x.id === posId); if (!p) return;
@@ -4668,7 +4678,7 @@ async function openSell(posId, frac) {
   const net = gross != null && imp != null && fees ? gross * (1 - imp) - fees.total : null;
   const ok = await confirmDialog(`Verkaufen · ${p.symbol} (${frac === 'ALL' ? '100' : Math.round(frac * 100)} %)`, 'Simulierter Verkauf mit frischem Preis (Pre-Exit-Check).', {
     confirmLabel: 'Verkaufen', danger: true,
-    extra: html`<div class="grid2">${kv('Menge', fmtNum(qty, 2))}${kv('Preis', fmtPrice(p.lastPrice), p.priceLabel)}${kv('Erw. Erlös netto', net != null ? fmtUsd(net) : 'n/v', 'ESTIMATED')}${kv('Price Impact', imp != null ? (imp * 100).toFixed(3) + '%' : 'n/v', 'ESTIMATED')}</div>`
+    extra: html`<div class="grid2">${kv('Menge', fmtNum(qty, 2))}${kv('Preis', mcOrPrice(p, t, p.lastPrice), p.priceLabel, fmtPrice(p.lastPrice))}${kv('Erw. Erlös netto', net != null ? fmtUsd(net) : 'n/v', 'ESTIMATED')}${kv('Price Impact', imp != null ? (imp * 100).toFixed(3) + '%' : 'n/v', 'ESTIMATED')}</div>`
   });
   if (!ok) return;
   const r = await core.executeSell(posId, frac, 'MANUAL', { detail: 'Manueller Verkauf' });

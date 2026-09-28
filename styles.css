@@ -266,6 +266,8 @@ pre.raw{white-space:pre-wrap;word-break:break-all;font:11px/1.4 var(--mono);back
   .bottomnav button i{font-style:normal;font-size:18px}
   .bottomnav button.on{color:var(--text);background:#ffffff0a}
   .grid3{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .card .grid4{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .card,.cards2{min-width:0;max-width:100%}
   .tile{min-height:64px;padding:10px}
   .tile svg{width:28px;height:28px}
   .logrow{grid-template-columns:60px 70px 1fr}.logrow .cat{display:none}
