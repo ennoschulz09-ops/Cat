@@ -295,6 +295,8 @@ const SETTINGS_SCHEMA = [
   { k: 'securityTtlMin', s: 'Scanner', l: 'Security-Daten gültig für', t: 'int', def: 30, min: 5, max: 240, u: 'min' },
   { k: 'rpcUrls', s: 'Scanner', l: 'Solana RPC-URLs (Komma-getrennt, nur https). Für stabilen Betrieb einen eigenen Key-Provider (Helius/QuickNode/Triton/Ankr) als ersten Eintrag setzen – öffentliche Endpoints sind hart ratenlimitiert (403/Timeouts sind normal, kein Bug).', t: 'text', def: 'https://api.mainnet-beta.solana.com, https://solana-rpc.publicnode.com, https://rpc.ankr.com/solana' },
   { k: 'keepScannerOnEstop', s: 'Scanner', l: 'Scanner bei Emergency Stop weiterlaufen lassen', t: 'bool', def: true },
+  { k: 'alwaysTrade', s: 'Risiko', l: 'Always-Trade: Bot nie pausiert/blockiert – lernt aus Verlusten & Fehlern', t: 'bool', def: true },
+  { k: 'estopAutoReleaseSec', s: 'Risiko', l: 'Always-Trade: Emergency Stop hebt sich automatisch auf nach', t: 'int', def: 120, min: 10, max: 3600, u: 's' },
   // Filter
   { k: 'minLiq', s: 'Filter', l: 'Min. Liquidität', t: 'num', def: 10000, min: 0, max: 1e9, u: '$' },
   { k: 'minVol1h', s: 'Filter', l: 'Min. Volumen 1h', t: 'num', def: 20000, min: 0, max: 1e10, u: '$' },
@@ -1261,7 +1263,8 @@ function decideToken(tok, A, ctx) {
   const strat = evalStrategies(A, ctx.strategies, S);
   A.strat = strat;
   stageRun('DECISION', add => {
-    if (A.finalScore < S.minScore) add('SCORE_TOO_LOW', `Final Score ${A.finalScore} < ${S.minScore}`);
+    const eMin = S.minScore + (S.alwaysTrade && ctx.learn ? ctx.learn.scoreBump : 0);
+    if (A.finalScore < eMin) add('SCORE_TOO_LOW', `Final Score ${A.finalScore} < ${eMin}${eMin !== S.minScore ? ' (gelernt +' + (eMin - S.minScore) + ')' : ''}`);
     if (!strat.consensus) add('NO_CONSENSUS', `Konsens ${strat.weightSum} < ${S.consensusMinWeight}`);
     return `Score ${A.finalScore}, Konsens ${strat.weightSum} (${strat.votes.filter(x => x.enabled && x.vote === 'BUY').map(x => x.name).join(', ')})`;
   });
@@ -1480,6 +1483,7 @@ function createCore(opts) {
     markets: new Map(), selected: null, sol: null,
     positions: [], orders: [], journal: [], feed: [], queue: [], locks: new Set(), usedKeys: new Map(),
     portfolio: freshPortfolio(1000),
+    learn: { scoreBump: 0, sizeMult: 1, lessons: [], errors: {}, dailyKey: '' },
     risk: { buyCount: {}, coinCooldown: {}, stratCooldown: {}, lossCooldownUntil: 0, globalPauseUntil: 0, lossStreak: 0, dayKey: '', dailyPnl: 0, dailyStartEquity: null, dailyTrades: 0, dailyLimitHit: false, reviewRequired: false, buyTimes: [] },
     watchlist: {}, seen: {}, alertMarks: {}, stratMarks: {},
     rpc: { slot: null, prevSlot: null, slotAt: 0, latency: null, endpoint: null },
@@ -1930,7 +1934,8 @@ function createCore(opts) {
       Cash: Math.max(0, state.portfolio.cash * 0.98)
     };
     const capBy = Object.entries(caps).sort((a, b) => a[1] - b[1])[0];
-    const size = Math.max(0, capBy[1]);
+    let size = Math.max(0, capBy[1]);
+    if (s.alwaysTrade) { const raw = size; size = raw * state.learn.sizeMult; if (size < MIN_ORDER_USD && raw >= MIN_ORDER_USD) size = MIN_ORDER_USD; }
     const factors = { basePct, fRisk: m2(fRisk), fConf: m2(fConf), fVol: m2(fVol), caps: Object.fromEntries(Object.entries(caps).map(([k, v]) => [k, m2(v)])) };
     if (size < MIN_ORDER_USD) return { size: 0, reason: `Größe ${fmtUsd(size)} < Minimum ${fmtUsd(MIN_ORDER_USD)} (begrenzt durch ${capBy[0]})`, factors, capBy: capBy[0] };
     return { size: m2(size), capBy: capBy[0], factors };
@@ -1944,22 +1949,22 @@ function createCore(opts) {
     if (b.emergency) add('EMERGENCY_STOP', 'Emergency Stop aktiv' + (b.emergencyReason ? ': ' + b.emergencyReason : ''));
     if (state.mode === 'LIVE') add('LIVE_UNAVAILABLE', 'LIVE: kein verifizierter Wallet-/Swap-Provider (REQUIRES EXTERNAL PROVIDER)');
     if (state.mode === 'READ_ONLY') add('MODE_READ_ONLY', 'READ ONLY / WATCH-ONLY: Trades immer blockiert');
-    if (b.safeMode) add('SAFE_MODE', 'Safe Mode: keine neuen Käufe' + (b.safeAuto ? ' (automatisch nach Fehlern aktiviert)' : ''));
+    if (b.safeMode && !s.alwaysTrade) add('SAFE_MODE', 'Safe Mode: keine neuen Käufe' + (b.safeAuto ? ' (automatisch nach Fehlern aktiviert)' : ''));
     if (auto) {
-      if (!b.autoTrading) add('AUTO_TRADING_OFF', 'Auto-Trading ist AUS (Bot analysiert nur)');
+      if (!b.autoTrading && !s.alwaysTrade) add('AUTO_TRADING_OFF', 'Auto-Trading ist AUS (Bot analysiert nur)');
       if (state.mode === 'PAPER') add('PAPER_MANUAL', 'PAPER-Modus: nur manuelle Trades');
       if (b.state === 'RECOVERING' || b.state === 'STARTING') add('RECOVERING', 'Recovery – warte auf ausreichende Datenqualität');
-      else if (b.state !== 'RUNNING') add('BOT_NOT_RUNNING', 'Bot-Status: ' + b.state);
+      else if (b.state !== 'RUNNING' && !(s.alwaysTrade && (b.state === 'PAUSED' || b.state === 'ERROR'))) add('BOT_NOT_RUNNING', 'Bot-Status: ' + b.state);
     }
     if (!env.online()) add('OFFLINE', 'Keine Netzwerkverbindung');
     const h = systemHealth(); if (h.score < s.minSystemHealth) add('SYSTEM_UNHEALTHY', `System Health ${h.score} < ${s.minSystemHealth}`);
     if (!state.sol || now - state.sol.at > 5 * MIN) add('FEE_UNKNOWN', 'SOL-Preis unbekannt/veraltet → Gebühren nicht berechenbar');
-    if (state.reconciliation.required) add('RECONCILIATION_REQUIRED', 'Abgleich nach Neustart erforderlich – bitte prüfen & bestätigen');
+    if (state.reconciliation.required && !s.alwaysTrade) add('RECONCILIATION_REQUIRED', 'Abgleich nach Neustart erforderlich – bitte prüfen & bestätigen');
     const rpcSt = rpcEndpoints().map(e => http.status(e.name));
     if (rpcSt.length && rpcSt.every(x => x === 'OFFLINE') && (!s.ffRugcheck || http.status('rugcheck') === 'OFFLINE')) add('SECURITY_SOURCES_DOWN', 'Alle Security-Quellen (RPC' + (s.ffRugcheck ? ', RugCheck' : '') + ') OFFLINE');
-    if (r.dailyLimitHit) add('DAILY_LOSS_LIMIT', `Tagesverlust-Limit erreicht (${fmtSigned(r.dailyPnl)})`);
-    if (r.globalPauseUntil > now) add('GLOBAL_PAUSE', `Globale Pause nach Verlustserie – noch ${fmtAge(r.globalPauseUntil - now)}`);
-    if (r.lossCooldownUntil > now) add('LOSS_COOLDOWN', `Loss-Cooldown – noch ${fmtAge(r.lossCooldownUntil - now)}`);
+    if (r.dailyLimitHit && !s.alwaysTrade) add('DAILY_LOSS_LIMIT', `Tagesverlust-Limit erreicht (${fmtSigned(r.dailyPnl)})`);
+    if (r.globalPauseUntil > now && !s.alwaysTrade) add('GLOBAL_PAUSE', `Globale Pause nach Verlustserie – noch ${fmtAge(r.globalPauseUntil - now)}`);
+    if (r.lossCooldownUntil > now && !s.alwaysTrade) add('LOSS_COOLDOWN', `Loss-Cooldown – noch ${fmtAge(r.lossCooldownUntil - now)}`);
     const hourBuys = r.buyTimes.filter(x => now - x < HOUR).length;
     if (hourBuys >= s.maxTradesPerHour) add('OVERTRADING', `${hourBuys} Käufe in 60 min (Limit ${s.maxTradesPerHour})`);
     else {
@@ -2265,7 +2270,9 @@ function createCore(opts) {
     pos.status = 'CLOSED'; pos.closedAt = now; pos.exitReason = reason;
     state.positions = state.positions.filter(p => p.id !== pos.id);
     const pnl = pos.realizedUsd, win = pnl > 0;
-    if (!win) {
+    if (!win && s.alwaysTrade) {
+      r.lossStreak++; learnFromTrade(pos, pnl, false);
+    } else if (!win) {
       r.lossStreak++; r.lossCooldownUntil = now + s.lossCooldownMin * MIN;
       log.risk(`Verlust ${pos.symbol} ${fmtSigned(pnl)} → Loss-Cooldown ${s.lossCooldownMin} min (Serie ${r.lossStreak})`);
       if (r.lossStreak >= s.lossStreakLimit) {
@@ -2273,7 +2280,7 @@ function createCore(opts) {
         log.risk(`${r.lossStreak} Verluste in Folge → globale Pause ${s.globalPauseMin} min`);
         alert('RISK', null, `${r.lossStreak} Verluste in Folge → globale Pause ${s.globalPauseMin} min. Kontrollierter Review empfohlen.`, 'CRITICAL', { key: 'streak', cooldownMs: 0 });
       }
-    } else r.lossStreak = 0;
+    } else { r.lossStreak = 0; if (s.alwaysTrade) learnFromTrade(pos, pnl, true); }
     ensureSession();
     const se = state.session; se.trades++; if (win) se.wins++; else se.losses++; se.pnl = m6(se.pnl + pnl);
     journalClose(pos);
@@ -2286,9 +2293,47 @@ function createCore(opts) {
     const eq = equityInfo(); state.hist.equity.push({ t: now, v: m2(eq.equity), realized: m2(state.portfolio.realized) }); if (state.hist.equity.length > 500) state.hist.equity.shift();
     maybeTune();
   }
+  /* ---------- Always-Trade: Lernen statt Stoppen ---------- */
+  function addLesson(kind, text) {
+    const L = state.learn; L.lessons.unshift({ ts: env.now(), kind, text: str(text, 200) }); if (L.lessons.length > 50) L.lessons.length = 50;
+  }
+  function learnFromTrade(pos, pnl, win) {
+    const L = state.learn;
+    if (win) { L.scoreBump = Math.max(0, L.scoreBump - 2); L.sizeMult = Math.min(1, L.sizeMult + 0.15); }
+    else { L.scoreBump = Math.min(10, L.scoreBump + 2); L.sizeMult = Math.max(0.35, L.sizeMult - 0.15); }
+    addLesson(win ? 'WIN' : 'LOSS', `${pos.symbol} ${fmtSigned(pnl)} (${pos.exitReason || '—'}) → Score-Schwelle +${L.scoreBump}, Größe ×${L.sizeMult.toFixed(2)}`);
+    log.info('RISK', `Lernen: ${win ? 'Gewinn' : 'Verlust'} ${pos.symbol} ${fmtSigned(pnl)} → Score-Schwelle +${L.scoreBump}, Positionsgröße ×${L.sizeMult.toFixed(2)} (Bot handelt weiter)`);
+  }
+  function learnFromError(e) {
+    const L = state.learn, sig = str(String(e && e.message || e), 60);
+    L.errors[sig] = (L.errors[sig] || 0) + 1;
+    const keys = Object.keys(L.errors); if (keys.length > 30) delete L.errors[keys[0]];
+    if (L.errors[sig] === 1 || L.errors[sig] % 10 === 0) addLesson('ERROR', `${sig} (×${L.errors[sig]}) → Scan läuft mit Backoff weiter`);
+  }
+  function keepAlive() {
+    const b = state.bot, s = S(), now = env.now();
+    if (b.emergency) {
+      if (!b.emergencyAt) b.emergencyAt = now;
+      if (now - b.emergencyAt < s.estopAutoReleaseSec * SEC) return;
+      releaseEmergency(); log.warn('SYSTEM', `Always-Trade: Emergency Stop nach ${s.estopAutoReleaseSec}s automatisch aufgehoben`);
+    }
+    if (b.desired !== 'RUNNING') b.desired = 'RUNNING';
+    if (b.safeMode) { b.safeMode = false; b.safeAuto = false; }
+    if (!b.autoTrading && state.mode === 'SIMULATION') b.autoTrading = true;
+    if (b.state === 'PAUSED') setBotState(isReady() ? 'RUNNING' : 'RECOVERING', 'Always-Trade: automatisch fortgesetzt');
+    else if (b.state === 'ERROR') setBotState('RECOVERING', 'Always-Trade: Auto-Recovery');
+  }
   function checkDailyLimit() {
     const r = state.risk, s = S();
     const base = r.dailyStartEquity || state.portfolio.startCapital;
+    if (s.alwaysTrade) {
+      if (state.learn.dailyKey !== r.dayKey && r.dailyPnl <= -base * s.dailyLossLimitPct / 100) {
+        state.learn.dailyKey = r.dayKey; state.learn.sizeMult = Math.min(state.learn.sizeMult, 0.5);
+        addLesson('DAILY', `Tagesverlust ${fmtSigned(r.dailyPnl)} → Positionsgröße halbiert, Bot handelt weiter`);
+        log.risk(`Tagesverlust ${fmtSigned(r.dailyPnl)} → Positionsgröße ×0.5 (Always-Trade: kein Stopp)`);
+      }
+      return;
+    }
     if (!r.dailyLimitHit && r.dailyPnl <= -base * s.dailyLossLimitPct / 100) {
       r.dailyLimitHit = true;
       if (state.bot.autoTrading) { state.bot.autoTrading = false; audit('BOT', 'AUTO_TRADING_OFF', 'Tagesverlust-Limit erreicht'); }
@@ -2353,7 +2398,7 @@ function createCore(opts) {
   /* ---------- Analyse aller Tokens ---------- */
   function buildCtx() {
     const eq = equityInfo();
-    return { now: env.now(), S: S(), strategies: state.strategies, plannedSizeUsd: Math.max(0, (eq.equity || 0) * S().maxPositionPct / 100), execCheck: (t, A, o) => execCheck(t, A, o) };
+    return { now: env.now(), S: S(), learn: state.learn, strategies: state.strategies, plannedSizeUsd: Math.max(0, (eq.equity || 0) * S().maxPositionPct / 100), execCheck: (t, A, o) => execCheck(t, A, o) };
   }
   function analyzeAll() {
     const ctx = buildCtx(), pinned = pinnedIds(), now = env.now();
@@ -2418,6 +2463,7 @@ function createCore(opts) {
   }
   function updateReadiness() {
     const b = state.bot;
+    if (S().alwaysTrade) keepAlive();
     if (b.state === 'RECOVERING' && isReady()) { setBotState(b.desired === 'PAUSED' ? 'PAUSED' : 'RUNNING', 'READY – Datenqualität ausreichend'); b.readyAt = env.now(); }
     else if (b.state === 'RUNNING' && (!env.online() || systemHealth().score < 30)) setBotState('RECOVERING', `System Health ${systemHealth().score} – Trading pausiert bis Datenqualität zurück ist`);
     else if (b.state === 'ERROR' && env.now() - b.errorAt > 30 * SEC) setBotState('RECOVERING', 'Automatischer Recovery-Versuch');
@@ -2488,7 +2534,8 @@ function createCore(opts) {
     } catch (e) {
       sc.errors++; state.bot.errorStreak++; state.bot.lastError = e.message;
       log.error('SCANNER', `Scan #${scanId} fehlgeschlagen: ${e.message}`);
-      if (state.bot.errorStreak >= 5 && !['ERROR', 'EMERGENCY_STOP', 'STOPPED'].includes(state.bot.state)) {
+      learnFromError(e);
+      if (!S().alwaysTrade && state.bot.errorStreak >= 5 && !['ERROR', 'EMERGENCY_STOP', 'STOPPED'].includes(state.bot.state)) {
         setBotState('ERROR', e.message); state.bot.errorAt = env.now(); state.bot.safeMode = true; state.bot.safeAuto = true;
         alert('SYSTEM', null, 'Wiederholte Scan-Fehler – Safe Mode aktiviert: ' + e.message, 'CRITICAL', { key: 'scanerr' });
       }
@@ -2507,7 +2554,7 @@ function createCore(opts) {
     scanOnce().finally(() => {
       if (!state.scanner.running) return;
       const base = S().scanIntervalMs;
-      const delay = http.status('dexPairs') === 'OFFLINE' ? Math.min(base * 5, 15000) : Math.max(base - (env.now() - started), 100);
+      const delay = http.status('dexPairs') === 'OFFLINE' ? Math.min(base * 5, 15000) : state.bot.errorStreak > 0 ? Math.min(base * (1 + state.bot.errorStreak), 15000) : Math.max(base - (env.now() - started), 100);
       state.scanner.nextAt = env.now() + delay;
       setT('scan', loop, delay);
     });
@@ -2546,12 +2593,14 @@ function createCore(opts) {
     return { ok: true };
   }
   function pause() {
+    if (S().alwaysTrade) { log.info('SYSTEM', 'Pause ignoriert – Always-Trade aktiv'); return { ok: false, error: 'Always-Trade aktiv – Pause deaktiviert (Einstellungen → Risiko)' }; }
     const b = state.bot; b.desired = 'PAUSED';
     if (['RUNNING', 'RECOVERING'].includes(b.state)) setBotState('PAUSED', 'keine neuen Auto-Trades, Scanner & Exits laufen weiter');
     state.queue = []; audit('USER', 'PAUSE', ''); persistNow();
     return { ok: true };
   }
   function stop() {
+    if (S().alwaysTrade) { log.info('SYSTEM', 'Stop ignoriert – Always-Trade aktiv'); return { ok: false, error: 'Always-Trade aktiv – Stop deaktiviert (Einstellungen → Risiko)' }; }
     const b = state.bot; b.desired = 'STOPPED';
     stopScanner();
     for (const q of state.queue) log.info('TRADE', `Queue-Eintrag ${q.tokenId} beim Stop verworfen`);
@@ -2564,7 +2613,7 @@ function createCore(opts) {
   async function emergencyStop(reason = 'Manuell ausgelöst') {
     const b = state.bot;
     if (b.emergency) return { ok: true };
-    b.emergency = true; b.emergencyReason = str(reason, 120); b.autoTrading = false;
+    b.emergency = true; b.emergencyAt = env.now(); b.emergencyReason = str(reason, 120); b.autoTrading = false;
     if (!setBotState('EMERGENCY_STOP', reason)) b.state = 'EMERGENCY_STOP';
     const cancelled = state.queue.length; state.queue = [];
     for (const o of state.orders) if (['DETECTED', 'QUEUED'].includes(o.state)) { try { transition(o, 'CANCELLED', 'Emergency Stop'); } catch (e) { /* bereits terminal */ } }
@@ -2899,7 +2948,7 @@ function createCore(opts) {
       settings: { settings: state.settings, strategies: state.strategies, watchlist: state.watchlist, ui: state.ui },
       positions: { tradeSeq: seq, portfolio: state.portfolio, positions: state.positions, orders: state.orders.slice(0, 150), usedKeys: [...state.usedKeys.entries()].filter(([, v]) => v !== 'pending').slice(-600) },
       trades: { tradeSeq: seq, journal: state.journal.slice(0, 500) },
-      runtime: { tradeSeq: seq, savedAt: now, app: APP_VERSION, mode: state.mode, bot: { desired: state.bot.desired, autoTrading: state.bot.autoTrading, safeMode: state.bot.safeMode, emergency: state.bot.emergency, emergencyReason: state.bot.emergencyReason }, risk: state.risk, session: state.session, seen, alertMarks: marks, reconciliation: state.reconciliation },
+      runtime: { tradeSeq: seq, savedAt: now, app: APP_VERSION, mode: state.mode, bot: { desired: state.bot.desired, autoTrading: state.bot.autoTrading, safeMode: state.bot.safeMode, emergency: state.bot.emergency, emergencyReason: state.bot.emergencyReason }, risk: state.risk, session: state.session, seen, alertMarks: marks, reconciliation: state.reconciliation, learn: state.learn },
       logs: { logs: log.entries.slice(-200), auditLog: state.auditLog.slice(0, 300), configLog: state.configLog.slice(0, 100), feed: state.feed.slice(0, 80) },
       stats: { hist: state.hist, stratStats: state.stratStats, falseSignals: state.falseSignals.slice(0, 50), paramVersions: state.paramVersions, activeParam: state.activeParam, sessions: state.sessions.slice(0, 50) }
     };
@@ -2922,6 +2971,15 @@ function createCore(opts) {
       state.bot.autoTrading = d.bot.autoTrading === true && state.mode === 'SIMULATION';
       state.bot.safeMode = d.bot.safeMode === true; state.bot.emergency = d.bot.emergency === true; state.bot.emergencyReason = str(d.bot.emergencyReason, 120);
     }
+    if (d.learn && typeof d.learn === 'object') {
+      const L = state.learn;
+      if (isNum(d.learn.scoreBump)) L.scoreBump = clamp(d.learn.scoreBump, 0, 10);
+      if (isNum(d.learn.sizeMult)) L.sizeMult = clamp(d.learn.sizeMult, 0.35, 1);
+      L.lessons = arr(d.learn.lessons).filter(x => x && isNum(x.ts)).slice(0, 50);
+      if (d.learn.errors && typeof d.learn.errors === 'object') L.errors = d.learn.errors;
+      if (typeof d.learn.dailyKey === 'string') L.dailyKey = d.learn.dailyKey;
+    }
+    if (state.settings.alwaysTrade) { state.bot.desired = 'RUNNING'; state.bot.safeMode = false; state.bot.emergency = false; state.bot.emergencyReason = ''; if (state.mode === 'SIMULATION') state.bot.autoTrading = true; }
     const numMap = (o, maxV) => { const out = {}; if (o && typeof o === 'object') for (const [k, v] of Object.entries(o)) if (k.startsWith('solana:') && isNum(v) && v >= 0) out[k] = maxV != null ? Math.min(v, maxV) : v; return out; };
     if (d.risk && typeof d.risk === 'object') {
       const r = d.risk, R = state.risk;
@@ -3135,7 +3193,7 @@ function makeTestHarness() {
 async function testCore(H, settings) {
   const core = createCore({ env: H.env, backend: H.backend || (H.backend = createMemoryBackend()) });
   core.init({ autoStart: false });
-  core.updateSettings({ minPairAgeMin: 0, ...(settings || {}) }, 'TEST');
+  core.updateSettings({ minPairAgeMin: 0, alwaysTrade: false, ...(settings || {}) }, 'TEST');
   await core._t.updateSolPrice(true);
   return core;
 }
@@ -4707,8 +4765,8 @@ const ACTIONS = {
   sort: el => { const k = el.dataset.k; if (UI.sort === k) UI.dir = -UI.dir; else { UI.sort = k; UI.dir = k === 'age' || k === 'risk' ? 1 : -1; } saveUi(); renderScanner(); },
   rank: el => { UI.rankBy = el.dataset.k; saveUi(); renderView(true); },
   start: () => { const r = core.start(); toast(r.ok ? 'SUCCESS' : 'ERROR', r.ok ? 'Bot gestartet' : r.error, r.ok ? 'Recovery → Running, sobald Datenqualität ausreicht' : ''); scheduleRender(true); },
-  pause: () => { core.pause(); toast('INFO', 'Bot pausiert', 'Scanner & Exits laufen weiter, keine neuen Auto-Trades'); scheduleRender(true); },
-  stop: async () => { if (core.state.positions.length && !(await confirmDialog('Bot stoppen?', `${core.state.positions.length} offene Position(en) werden bei gestopptem Bot nicht überwacht (keine Stops/TPs).`, { danger: true, confirmLabel: 'Stoppen' }))) return; core.stop(); toast('WARNING', 'Bot gestoppt', 'Scanner aus, Timer gelöscht, Requests abgebrochen'); scheduleRender(true); },
+  pause: () => { const r = core.pause(); if (r && r.ok === false) toast('INFO', 'Bot läuft weiter', r.error); else toast('INFO', 'Bot pausiert', 'Scanner & Exits laufen weiter, keine neuen Auto-Trades'); scheduleRender(true); },
+  stop: async () => { if (core.state.positions.length && !(await confirmDialog('Bot stoppen?', `${core.state.positions.length} offene Position(en) werden bei gestopptem Bot nicht überwacht (keine Stops/TPs).`, { danger: true, confirmLabel: 'Stoppen' }))) return; { const r = core.stop(); if (r && r.ok === false) { toast('INFO', 'Bot läuft weiter', r.error); return; } } toast('WARNING', 'Bot gestoppt', 'Scanner aus, Timer gelöscht, Requests abgebrochen'); scheduleRender(true); },
   safe: () => { core.setSafeMode(!core.state.bot.safeMode); toast('INFO', 'Safe Mode ' + (core.state.bot.safeMode ? 'AN' : 'AUS')); scheduleRender(true); },
   mode: el => { const r = core.setMode(el.dataset.mode); toast(r.ok ? 'INFO' : 'ERROR', r.ok ? 'Modus: ' + el.dataset.mode.replace('_', ' ') : r.error); scheduleRender(true); },
   live: async () => {
