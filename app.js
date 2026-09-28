@@ -296,6 +296,8 @@ const SETTINGS_SCHEMA = [
   { k: 'rpcUrls', s: 'Scanner', l: 'Solana RPC-URLs (Komma-getrennt, nur https). Für stabilen Betrieb einen eigenen Key-Provider (Helius/QuickNode/Triton/Ankr) als ersten Eintrag setzen – öffentliche Endpoints sind hart ratenlimitiert (403/Timeouts sind normal, kein Bug).', t: 'text', def: 'https://api.mainnet-beta.solana.com, https://solana-rpc.publicnode.com, https://rpc.ankr.com/solana' },
   { k: 'keepScannerOnEstop', s: 'Scanner', l: 'Scanner bei Emergency Stop weiterlaufen lassen', t: 'bool', def: true },
   { k: 'alwaysTrade', s: 'Risiko', l: 'Always-Trade: Bot nie pausiert/blockiert – lernt aus Verlusten & Fehlern', t: 'bool', def: true },
+  { k: 'idleRelaxMin', s: 'Risiko', l: 'Always-Trade: Schwellen lockern alle … min ohne Kauf (0 = aus)', t: 'int', def: 5, min: 0, max: 120, u: 'min' },
+  { k: 'idleRelaxMaxPts', s: 'Risiko', l: 'Always-Trade: max. Lockerung (Score/Confidence/Risk-Punkte)', t: 'int', def: 18, min: 0, max: 30 },
   { k: 'estopAutoReleaseSec', s: 'Risiko', l: 'Always-Trade: Emergency Stop hebt sich automatisch auf nach', t: 'int', def: 120, min: 10, max: 3600, u: 's' },
   // Filter
   { k: 'minLiq', s: 'Filter', l: 'Min. Liquidität', t: 'num', def: 10000, min: 0, max: 1e9, u: '$' },
@@ -1256,15 +1258,18 @@ function decideToken(tok, A, ctx) {
   });
   stageRun('SIGNAL_ENGINE', add => { if (!A.signals.some(x => !CONTEXT_SIGNALS.has(x.type))) add('NO_SIGNAL', 'Keine Kaufsignale (nur Kontext-Signale)'); return A.signals.map(x => SIGNAL_NAMES[x.type] + ' ' + x.strength).join(', '); });
   stageRun('RISK_ENGINE', add => {
-    if (A.risk.level === 'CRITICAL' || A.risk.total > S.maxRiskScore) add('RISK_TOO_HIGH', `Risk ${A.risk.total} (${A.risk.level}) > ${S.maxRiskScore}`);
-    if (A.confidence.total < S.minConfidence) add('CONFIDENCE_LOW', `Confidence ${A.confidence.total} < ${S.minConfidence}`);
+    const rpR = S.alwaysTrade ? (ctx.relaxPts || 0) : 0, maxRisk = Math.min(85, S.maxRiskScore + rpR), minConf = Math.max(40, S.minConfidence - rpR);
+    if (A.risk.level === 'CRITICAL' || A.risk.total > maxRisk) add('RISK_TOO_HIGH', `Risk ${A.risk.total} (${A.risk.level}) > ${maxRisk}`);
+    if (A.confidence.total < minConf) add('CONFIDENCE_LOW', `Confidence ${A.confidence.total} < ${minConf}`);
     return `Risk ${A.risk.total} ${A.risk.level}, Confidence ${A.confidence.total}`;
   });
-  const strat = evalStrategies(A, ctx.strategies, S);
+  const rp = S.alwaysTrade ? (ctx.relaxPts || 0) : 0;
+  const stratsEff = rp ? Object.fromEntries(Object.entries(ctx.strategies).map(([k, c]) => [k, { ...c, minScore: Math.max(40, c.minScore - rp), minConfidence: Math.max(40, c.minConfidence - rp), riskLimit: Math.min(85, c.riskLimit + rp) }])) : ctx.strategies;
+  const strat = evalStrategies(A, stratsEff, S);
   A.strat = strat;
   stageRun('DECISION', add => {
-    const eMin = S.minScore + (S.alwaysTrade && ctx.learn ? ctx.learn.scoreBump : 0);
-    if (A.finalScore < eMin) add('SCORE_TOO_LOW', `Final Score ${A.finalScore} < ${eMin}${eMin !== S.minScore ? ' (gelernt +' + (eMin - S.minScore) + ')' : ''}`);
+    const eMin = S.alwaysTrade ? Math.max(40, S.minScore + (ctx.learn ? ctx.learn.scoreBump : 0) - rp) : S.minScore;
+    if (A.finalScore < eMin) add('SCORE_TOO_LOW', `Final Score ${A.finalScore} < ${eMin}${eMin !== S.minScore ? ' (angepasst ' + (eMin > S.minScore ? '+' : '') + (eMin - S.minScore) + ')' : ''}`);
     if (!strat.consensus) add('NO_CONSENSUS', `Konsens ${strat.weightSum} < ${S.consensusMinWeight}`);
     return `Score ${A.finalScore}, Konsens ${strat.weightSum} (${strat.votes.filter(x => x.enabled && x.vote === 'BUY').map(x => x.name).join(', ')})`;
   });
@@ -1966,7 +1971,8 @@ function createCore(opts) {
     if (r.globalPauseUntil > now && !s.alwaysTrade) add('GLOBAL_PAUSE', `Globale Pause nach Verlustserie – noch ${fmtAge(r.globalPauseUntil - now)}`);
     if (r.lossCooldownUntil > now && !s.alwaysTrade) add('LOSS_COOLDOWN', `Loss-Cooldown – noch ${fmtAge(r.lossCooldownUntil - now)}`);
     const hourBuys = r.buyTimes.filter(x => now - x < HOUR).length;
-    if (hourBuys >= s.maxTradesPerHour) add('OVERTRADING', `${hourBuys} Käufe in 60 min (Limit ${s.maxTradesPerHour})`);
+    if (s.alwaysTrade) { /* Always-Trade: kein Overtrading-Throttle */ }
+    else if (hourBuys >= s.maxTradesPerHour) add('OVERTRADING', `${hourBuys} Käufe in 60 min (Limit ${s.maxTradesPerHour})`);
     else {
       const last = closedTradesRecent(5);
       if (last.length === 5 && now - last[0].closedAt < 30 * MIN && avg(last.map(j => j.holdMs || 0)) < 2 * MIN) add('OVERTRADING', 'Sehr kurze Haltezeiten der letzten 5 Trades – Throttle');
@@ -2396,9 +2402,17 @@ function createCore(opts) {
   }
 
   /* ---------- Analyse aller Tokens ---------- */
+  /* Always-Trade: je länger kein Kauf, desto lockerer die Schwellen (Score/Confidence/Risk). Sicherheits-Filter bleiben unangetastet. */
+  function idleRelaxPts() {
+    const s = S(); if (!s.alwaysTrade || !s.idleRelaxMin) return 0;
+    const r = state.risk, b = state.bot, now = env.now();
+    const last = Math.max(r.buyTimes.length ? r.buyTimes[r.buyTimes.length - 1] : 0, b.readyAt || 0, b.startedAt || 0);
+    if (!last) return 0;
+    return Math.min(s.idleRelaxMaxPts, Math.floor((now - last) / (s.idleRelaxMin * MIN)) * 3);
+  }
   function buildCtx() {
     const eq = equityInfo();
-    return { now: env.now(), S: S(), learn: state.learn, strategies: state.strategies, plannedSizeUsd: Math.max(0, (eq.equity || 0) * S().maxPositionPct / 100), execCheck: (t, A, o) => execCheck(t, A, o) };
+    return { now: env.now(), relaxPts: idleRelaxPts(), S: S(), learn: state.learn, strategies: state.strategies, plannedSizeUsd: Math.max(0, (eq.equity || 0) * S().maxPositionPct / 100), execCheck: (t, A, o) => execCheck(t, A, o) };
   }
   function analyzeAll() {
     const ctx = buildCtx(), pinned = pinnedIds(), now = env.now();
@@ -2655,7 +2669,8 @@ function createCore(opts) {
       return { state: 'READY', reason: `${ss.candidates} Kandidat(en) – ${ss.approved ? ss.approved + ' freigegeben' : 'Ausführung wartet: ' + (wait ? wait.msg : '—')}`, hard, soft };
     }
     const top = Object.entries(state.metrics.rejectReasons || {}).sort((a, x) => x[1] - a[1])[0];
-    return { state: 'WAITING', reason: 'Kein geeignetes Setup' + (top ? ` – häufigster Grund: ${(BLOCKER_DEFS[top[0]] || [])[2] || top[0]} (${top[1]}×)` : ''), hard, soft };
+    const rlx = idleRelaxPts();
+    return { state: 'WAITING', reason: 'Kein geeignetes Setup' + (rlx ? ` · Schwellen −${rlx} Pkt. gelockert` : '') + (top ? ` – häufigster Grund: ${(BLOCKER_DEFS[top[0]] || [])[2] || top[0]} (${top[1]}×)` : ''), hard, soft };
   }
   /* LIVE-Gating: LIVE nur separat, ausdrücklich und wenn ALLE Voraussetzungen erfüllt sind. Auto-Trading bedeutet nie Echtgeld. */
   function liveReadiness() {
